@@ -1,0 +1,321 @@
+/*
+ * HARDWARE CONNECTIONS:
+ * ---------------------------------------------------------
+ * IR Receiver (3-Pin Module):
+ *   - VCC (Right)  -> ESP32 3.3V
+ *   - GND (Middle) -> ESP32 GND
+ *   - OUT (Left)   -> ESP32 GPIO 15
+ *
+ * IR Transmitter (Clear LED - Direct Test Mode):
+ *   - Anode (Long leg)    -> ESP32 GPIO 4
+ *   - Cathode (Short leg) -> Two 220Ω Resistors in parallel -> ESP32 GND
+ * ---------------------------------------------------------
+ */
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Preferences.h>
+#include <IRrecv.h>
+#include <IRutils.h>
+#include <IRsend.h>
+
+// WiFi Access Point Credentials
+const char* ssid = "SmartRemote_ESP32";
+const char* password = "password123";
+
+WebServer server(80);
+Preferences prefs;
+
+// Pin Definitions
+const uint16_t kRecvPin = 15;
+const uint16_t kIrLedPin = 4;
+
+IRrecv irrecv(kRecvPin);
+IRsend irsend(kIrLedPin);
+decode_results results;
+
+// Variables to hold the most recently captured signal
+uint64_t lastCode = 0;
+decode_type_t lastProtocol = UNKNOWN;
+uint16_t lastBits = 0;
+String lastProtocolName = "None";
+
+// ---------------------------------------------------------
+// HTML & JavaScript Web Interface
+// ---------------------------------------------------------
+const char* index_html = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ESP32 Smart Remote</title>
+  <style>
+    :root {
+      /* Default button size controlled by slider */
+      --btn-size: 70px; 
+    }
+    body { font-family: Arial, sans-serif; text-align: center; margin-top: 20px; background-color: #121212; color: white;}
+    .container { max-width: 400px; margin: 0 auto; padding: 20px; background: #1e1e1e; border-radius: 10px; box-shadow: 0 4px 8px rgba(0,0,0,0.5); }
+    
+    /* Standard UI Buttons */
+    .nav-btn { background-color: #ffc107; color: black; border: none; padding: 15px; border-radius: 5px; width: 100%; margin-bottom: 20px; font-size: 16px; font-weight: bold; cursor: pointer; }
+    .save-btn { background-color: #28a745; color: white; border: none; padding: 15px; border-radius: 5px; width: 100%; font-size: 16px; cursor: pointer; }
+    input[type=text], select { padding: 10px; width: 90%; margin-bottom: 10px; border-radius: 5px; border: none; font-size: 16px; }
+    
+    /* Settings section */
+    .settings { background: #2a2a2a; padding: 10px; border-radius: 5px; margin-bottom: 15px; }
+    .slider { width: 100%; margin-top: 10px; }
+
+    /* Remote Button Grid */
+    #buttonContainer {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr); /* 3 columns like a real remote */
+      gap: 15px;
+      justify-items: center;
+      margin-top: 20px;
+    }
+
+    /* Circular Remote Buttons */
+    .remote-btn {
+      background-color: #333;
+      color: white;
+      border: 2px solid #555;
+      width: var(--btn-size);
+      height: var(--btn-size);
+      border-radius: 50%; /* Makes it perfectly round */
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: calc(var(--btn-size) * 0.25); /* Font scales with button */
+      font-weight: bold;
+      cursor: pointer;
+      box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+      transition: background-color 0.1s, transform 0.1s;
+    }
+    .remote-btn:active {
+      background-color: #007BFF;
+      transform: scale(0.95); /* Click animation */
+    }
+
+    #learn-section, #remote-section { display: none; }
+    .active-section { display: block !important; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h2>Smart Remote</h2>
+    <select id="deviceSelect" onchange="loadButtons()">
+      <option value="tv">Television</option>
+      <option value="stb">Set-Top Box</option>
+    </select>
+    
+    <button class="nav-btn" id="modeToggle" onclick="toggleMode()">Switch to Learn Mode</button>
+
+    <!-- REMOTE MODE UI -->
+    <div id="remote-section" class="active-section">
+      <div class="settings">
+        <label for="sizeSlider">Adjust Button Size</label>
+        <input type="range" id="sizeSlider" class="slider" min="50" max="120" value="70" oninput="updateSize(this.value)">
+      </div>
+      
+      <!-- The dynamic 3-column grid -->
+      <div id="buttonContainer"></div>
+    </div>
+
+    <!-- LEARN MODE UI -->
+    <div id="learn-section">
+      <h3>Learn a Button</h3>
+      <p>Press a button on your physical remote.</p>
+      <div style="background:#333; padding:10px; border-radius:5px; margin-bottom:15px;">
+        <span id="lastSignal">Waiting for signal...</span>
+      </div>
+      <input type="text" id="btnName" placeholder="Button Name (e.g., Power, 1, +)">
+      <button class="save-btn" onclick="saveButton()">Save Button</button>
+    </div>
+  </div>
+
+  <script>
+    let isLearnMode = false;
+
+    // Changes the CSS variable to dynamically resize all circular buttons instantly
+    function updateSize(val) {
+      document.documentElement.style.setProperty('--btn-size', val + 'px');
+    }
+
+    function toggleMode() {
+      isLearnMode = !isLearnMode;
+      document.getElementById('learn-section').classList.toggle('active-section', isLearnMode);
+      document.getElementById('remote-section').classList.toggle('active-section', !isLearnMode);
+      document.getElementById('modeToggle').innerText = isLearnMode ? "Switch to Remote Mode" : "Switch to Learn Mode";
+      if(!isLearnMode) loadButtons();
+    }
+
+    setInterval(() => {
+      if(isLearnMode) {
+        fetch('/latest_signal')
+          .then(response => response.text())
+          .then(text => document.getElementById('lastSignal').innerText = text);
+      }
+    }, 1000);
+
+    function saveButton() {
+      const name = document.getElementById('btnName').value;
+      const device = document.getElementById('deviceSelect').value;
+      if(!name) { alert("Please enter a button name!"); return; }
+      
+      fetch(`/save_button?device=${device}&name=${name}`)
+        .then(response => response.text())
+        .then(text => { alert(text); document.getElementById('btnName').value = ""; });
+    }
+
+    function loadButtons() {
+      const device = document.getElementById('deviceSelect').value;
+      fetch(`/get_buttons?device=${device}`)
+        .then(response => response.text())
+        .then(html => { document.getElementById('buttonContainer').innerHTML = html; });
+    }
+
+    function sendCommand(btnName) {
+      const device = document.getElementById('deviceSelect').value;
+      fetch(`/send_command?device=${device}&name=${btnName}`);
+    }
+
+    loadButtons();
+  </script>
+</body>
+</html>
+)rawliteral";
+
+// ---------------------------------------------------------
+// Server Route Handlers
+// ---------------------------------------------------------
+
+void handleRoot() {
+  server.send(200, "text/html", index_html);
+}
+
+void handleLatestSignal() {
+  if (lastCode == 0) {
+    server.send(200, "text/plain", "Waiting for signal...");
+    return;
+  }
+  String msg = "Code: 0x" + String((uint32_t)(lastCode >> 32), HEX) + String((uint32_t)lastCode, HEX) + " (" + lastProtocolName + ")";
+  server.send(200, "text/plain", msg);
+}
+
+void handleSaveButton() {
+  if (!server.hasArg("device") || !server.hasArg("name")) {
+    server.send(400, "text/plain", "Missing device or name");
+    return;
+  }
+  if (lastCode == 0 || lastProtocol == UNKNOWN) {
+    server.send(400, "text/plain", "No valid IR signal captured yet!");
+    return;
+  }
+
+  String device = server.arg("device");
+  String name = server.arg("name");
+  String prefix = device + "_" + name; 
+  
+  prefs.begin("ir_data", false);
+  prefs.putULong64((prefix + "_c").c_str(), lastCode);
+  prefs.putUShort((prefix + "_p").c_str(), (uint16_t)lastProtocol);
+  prefs.putUShort((prefix + "_b").c_str(), lastBits);
+
+  String btnList = prefs.getString((device + "_list").c_str(), "");
+  if (btnList.indexOf(name + ",") == -1) {
+    btnList += name + ",";
+    prefs.putString((device + "_list").c_str(), btnList);
+  }
+  
+  prefs.end();
+  server.send(200, "text/plain", "Saved " + name + " successfully!");
+}
+
+void handleGetButtons() {
+  String device = server.hasArg("device") ? server.arg("device") : "tv";
+  prefs.begin("ir_data", true);
+  String btnList = prefs.getString((device + "_list").c_str(), "");
+  prefs.end();
+
+  String html = "";
+  if (btnList == "") {
+    html = "<p style='grid-column: span 3;'>No buttons saved.</p>";
+  } else {
+    int start = 0;
+    int end = btnList.indexOf(',');
+    while (end != -1) {
+      String btnName = btnList.substring(start, end);
+      html += "<button class='remote-btn' onclick='sendCommand(\"" + btnName + "\")'>" + btnName + "</button>";
+      start = end + 1;
+      end = btnList.indexOf(',', start);
+    }
+  }
+  server.send(200, "text/html", html);
+}
+
+void handleSendCommand() {
+  if (!server.hasArg("device") || !server.hasArg("name")) {
+    server.send(400, "text/plain", "Error");
+    return;
+  }
+  String prefix = server.arg("device") + "_" + server.arg("name");
+  
+  prefs.begin("ir_data", true);
+  uint64_t codeToSend = prefs.getULong64((prefix + "_c").c_str(), 0);
+  decode_type_t protToSend = (decode_type_t)prefs.getUShort((prefix + "_p").c_str(), UNKNOWN);
+  uint16_t bitsToSend = prefs.getUShort((prefix + "_b").c_str(), 0);
+  prefs.end();
+
+  if (codeToSend != 0) {
+    irsend.send(protToSend, codeToSend, bitsToSend);
+    irrecv.resume(); 
+    server.send(200, "text/plain", "Sent");
+  } else {
+    server.send(404, "text/plain", "Not Found");
+  }
+}
+
+// ---------------------------------------------------------
+// Setup & Loop
+// ---------------------------------------------------------
+
+void setup() {
+  Serial.begin(115200);
+
+  irrecv.enableIRIn(); 
+  irsend.begin();
+
+  WiFi.softAP(ssid, password);
+  Serial.println("\nWiFi AP Started.");
+  Serial.print("Connect to network 'SmartRemote_ESP32' with password 'password123'.\n");
+  Serial.print("Then open browser to IP: ");
+  Serial.println(WiFi.softAPIP());
+
+  server.on("/", handleRoot);
+  server.on("/latest_signal", handleLatestSignal);
+  server.on("/save_button", HTTP_GET, handleSaveButton);
+  server.on("/get_buttons", HTTP_GET, handleGetButtons);
+  server.on("/send_command", HTTP_GET, handleSendCommand);
+
+  server.begin();
+}
+
+void loop() {
+  server.handleClient();
+
+  if (irrecv.decode(&results)) {
+    if (results.decode_type != UNKNOWN && !results.repeat) {
+      lastCode = results.value;
+      lastProtocol = results.decode_type;
+      lastBits = results.bits;
+      lastProtocolName = typeToString(results.decode_type);
+      
+      Serial.print("Received: 0x");
+      serialPrintUint64(lastCode, HEX);
+      Serial.println(" (" + lastProtocolName + ")");
+    }
+    irrecv.resume(); 
+  }
+}
